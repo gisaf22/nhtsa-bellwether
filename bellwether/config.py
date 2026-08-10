@@ -116,9 +116,23 @@ EMBEDDING_DIM: int = 1024
 # rather than in embed.py because novelty.py needs it too, and importing it
 # from embed.py pulled pyspark into every consumer — which meant the MCP
 # server could not be deployed without a Spark install it never uses.
-WORKSPACE_HOST: str = os.getenv(
-    "DATABRICKS_HOST", "https://dbc-d547a350-6525.cloud.databricks.com"
-).rstrip("/")
+def _workspace_host() -> str:
+    """Base URL for serving endpoints, scheme guaranteed.
+
+    A deployed Databricks App injects DATABRICKS_HOST as a bare hostname with
+    no scheme, while the CLI profile and the local default carry https://.
+    Without normalising, requests rejects the deployed value outright with
+    "No scheme supplied" — which only shows up in the app, never locally.
+    """
+    host = os.getenv(
+        "DATABRICKS_HOST", "https://dbc-d547a350-6525.cloud.databricks.com"
+    ).strip().rstrip("/")
+    if not host.startswith(("http://", "https://")):
+        host = f"https://{host}"
+    return host
+
+
+WORKSPACE_HOST: str = _workspace_host()
 
 
 # --- Windows ---------------------------------------------------------------
