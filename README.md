@@ -58,6 +58,34 @@ streamlit run app.py                                             # local UI
 Deployed as a Databricks App (`app.yaml`) backed by the same Lakebase
 instance: **https://nhtsa-bellwether-7474645136578041.aws.databricksapps.com/**
 
+## MCP server
+
+`bellwether_mcp_server.py` exposes the novelty check as two agent-callable
+tools, for use from Databricks Playground / Agent Bricks:
+
+| Tool | | |
+|---|---|---|
+| `search_recalls_for_pattern(pattern_id)` | read-only | Vehicle-scoped filter plus embedding shortlist against `recall_embeddings`. Returns candidate recalls with campaign numbers and similarity scores. Judges nothing, writes nothing. |
+| `check_novelty(pattern_id)` | **writes** | Same retrieval, then one LLM call for the verdict, then persists `novelty_verdict` / `novelty_recall_ref` to `patterns`. |
+
+```bash
+python bellwether_mcp_server.py
+```
+
+Both tools delegate straight into `bellwether/novelty.py` — the retrieval and
+matching logic has one implementation, shared with the batch job.
+
+`check_novelty` overwrites the stored verdict. Because it is reachable by
+anyone chatting with an agent, every overwrite of a non-null verdict first
+writes the previous value to `novelty_history` with a `source` tag (`batch`
+vs `mcp_tool`), so a conversational reassessment that flips a verdict leaves
+a trail. The app itself always shows the current value; there is no in-app
+undo.
+
+This is the conversational, tool-choosing interface. It is independent of the
+Streamlit app and the two coexist — the app is the one-click version, the MCP
+server is for asking questions and having an agent decide which tool to call.
+
 ## Limitations
 
 Stated plainly, because each one changes how the output should be read.

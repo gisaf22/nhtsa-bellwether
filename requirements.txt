@@ -6,3 +6,4 @@ numpy
 pyspark
 streamlit>=1.30
 databricks-sdk
+fastmcp>=3.2.0

@@ -268,6 +268,48 @@ def create_patterns(conn: psycopg.Connection) -> None:
     )
 
 
+def create_novelty_history(conn: psycopg.Connection) -> None:
+    """Prior novelty verdicts, written before each overwrite.
+
+    `patterns.novelty_verdict` holds only the current answer. That was
+    tolerable while the only writer was a controlled batch job, but the
+    verdict is now reachable from an MCP tool that anyone chatting with an
+    agent can invoke — a casual conversation could flip a verified verdict
+    with no trace of what it was. One row is written here for every
+    overwrite of a non-null verdict, so the previous value and its source
+    survive.
+
+    Deliberately append-only and never read by the pipeline: this is an audit
+    trail, not state. Note the cascade — `form_patterns()` truncates
+    `patterns` with `restart identity cascade`, which discards this history
+    along with the patterns it describes. That is the same one-way door
+    documented in the README, not an additional one.
+    """
+    conn.execute(
+        """
+        create table if not exists novelty_history (
+            id              bigint generated always as identity primary key,
+            pattern_id      bigint not null
+                            references patterns (id) on delete cascade,
+            old_verdict     text,
+            old_recall_ref  text,
+            new_verdict     text,
+            new_recall_ref  text,
+            -- Which path wrote it: 'batch' (assess_all), 'mcp_tool'
+            -- (check_novelty), or whatever a future caller passes.
+            source          text        not null,
+            changed_at      timestamptz not null default now()
+        )
+        """
+    )
+    conn.execute(
+        """
+        create index if not exists novelty_history_pattern_idx
+            on novelty_history (pattern_id, changed_at desc)
+        """
+    )
+
+
 def create_pattern_members(conn: psycopg.Connection) -> None:
     """Which complaints belong to which pattern, and at what similarity.
 
@@ -305,6 +347,7 @@ OBJECTS: tuple[tuple[str, Callable[[psycopg.Connection], None]], ...] = (
     ("recall_embeddings", create_recall_embeddings),
     ("patterns", create_patterns),
     ("pattern_members", create_pattern_members),
+    ("novelty_history", create_novelty_history),
 )
 
 

@@ -3,7 +3,12 @@
 Thin v1 of the agent step: structured filter (recalls for a vehicle the
 pattern actually has members on), embedding shortlist against
 recall_embeddings, one LLM call for the verdict. Writes novelty_verdict and
-novelty_recall_ref onto patterns.
+novelty_recall_ref onto patterns, preserving any replaced verdict in
+novelty_history.
+
+`assess_one()` is the single-pattern unit; `assess_all()` loops it and the
+MCP tool calls it directly, so there is one implementation of
+retrieve → judge → write rather than one per caller.
 
 Two known limitations, deliberate for now:
   - No recall-date scoping. A pattern can be called 'known' on the strength
@@ -156,6 +161,47 @@ def _shortlist(pattern_id: int, vehicles: list[tuple[str, str]]) -> list[dict]:
     ]
 
 
+def _load_pattern(pattern_id: int) -> dict | None:
+    """One pattern's id, name and distinct member vehicles."""
+    row = lakebase.execute(
+        """
+        select p.id, p.name,
+               array_agg(distinct c.make || '|' || c.model) as vehicles
+        from patterns p
+        join pattern_members pm on pm.pattern_id = p.id
+        join complaints c on c.odi_number = pm.odi_number
+        where p.id = %s
+        group by p.id, p.name
+        """,
+        (pattern_id,),
+        fetch="one",
+    )
+    if row is None:
+        return None
+    return {
+        "id": row[0],
+        "name": row[1],
+        "vehicles": [tuple(v.split("|", 1)) for v in row[2]],
+    }
+
+
+def shortlist_recalls(pattern_id: int) -> dict:
+    """Candidate recalls for one pattern — retrieval only, no LLM, no write.
+
+    The structured filter plus embedding shortlist half of the novelty check,
+    exposed on its own so it can be called without triggering a judgement.
+    `assess_one()` calls this too, so there is one implementation of the
+    retrieval step rather than one per caller.
+
+    Raises LookupError if the pattern does not exist, which is distinct from
+    it existing with no candidate recalls (empty `candidates`).
+    """
+    pattern = _load_pattern(pattern_id)
+    if pattern is None:
+        raise LookupError(f"no pattern with id {pattern_id}")
+    return {**pattern, "candidates": _shortlist(pattern_id, pattern["vehicles"])}
+
+
 def _samples(pattern_id: int) -> list[str]:
     rows = lakebase.execute(
         """
@@ -201,6 +247,121 @@ def _ask_llm(prompt: str, session: requests.Session) -> dict:
     raise RuntimeError("LLM endpoint rejected the credential twice")
 
 
+def _write_verdict(
+    pattern_id: int,
+    verdict: str,
+    recall_ref: str | None,
+    *,
+    source: str,
+) -> tuple[str | None, str | None]:
+    """Persist a verdict, preserving any prior one in novelty_history.
+
+    Returns the values that were replaced, so callers can report what
+    changed. History is only written when a prior verdict existed — a
+    first-ever assessment overwrites nothing and has nothing to preserve.
+
+    The read and both writes share one transaction: a verdict must never be
+    replaced without its predecessor being recorded, and `for update` holds
+    the row so two concurrent callers cannot interleave and lose one.
+    """
+    with lakebase.connect() as conn:
+        row = conn.execute(
+            "select novelty_verdict, novelty_recall_ref from patterns "
+            "where id = %s for update",
+            (pattern_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"no pattern with id {pattern_id}")
+        old_verdict, old_recall_ref = row
+
+        if old_verdict is not None:
+            conn.execute(
+                """
+                insert into novelty_history (
+                    pattern_id, old_verdict, old_recall_ref,
+                    new_verdict, new_recall_ref, source
+                ) values (%s, %s, %s, %s, %s, %s)
+                """,
+                (pattern_id, old_verdict, old_recall_ref, verdict,
+                 recall_ref, source),
+            )
+
+        conn.execute(
+            "update patterns set novelty_verdict = %s, novelty_recall_ref = %s, "
+            "updated_at = now() where id = %s",
+            (verdict, recall_ref, pattern_id),
+        )
+        conn.commit()
+
+    return old_verdict, old_recall_ref
+
+
+def assess_one(
+    pattern_id: int,
+    *,
+    source: str = "batch",
+    session: requests.Session | None = None,
+) -> dict:
+    """Retrieve, judge and persist a novelty verdict for one pattern.
+
+    The single-pattern unit that `assess_all()` runs in a loop and the MCP
+    tool calls directly, so both paths share one implementation of
+    retrieve → judge → write.
+
+    Overwrites any existing verdict, preserving the previous value in
+    novelty_history tagged with `source`.
+
+    Raises LookupError for an unknown pattern, ValueError if the model
+    returns something outside VERDICTS, and whatever _ask_llm raises when the
+    endpoint fails — callers decide whether one bad pattern is fatal.
+    """
+    found = shortlist_recalls(pattern_id)
+    candidates = found["candidates"]
+
+    if not candidates:
+        # No recall exists for any vehicle this pattern covers, so there is
+        # nothing for a model to weigh — novel by construction, and asking
+        # anyway would just invite an answer with no evidence behind it.
+        verdict, recall_ref = "novel", None
+        reason = "no published recall for any vehicle in this pattern"
+    else:
+        prompt = _PROMPT.format(
+            name=found["name"],
+            vehicles=", ".join(f"{mk} {md}" for mk, md in found["vehicles"]),
+            complaints="\n".join(f"- {s}" for s in _samples(pattern_id)),
+            recalls="\n".join(
+                f"- {c['campaign_number']} ({c['vehicle']}, {c['component']}): "
+                f"{(c['summary'] or '')[:600]} {(c['consequence'] or '')[:300]}"
+                for c in candidates
+            ),
+        )
+        answer = _ask_llm(prompt, session or requests.Session())
+        verdict = answer.get("verdict")
+        if verdict not in VERDICTS:
+            raise ValueError(f"model returned an unknown verdict: {verdict!r}")
+        recall_ref = answer.get("recall") or None
+        if verdict == "novel":
+            recall_ref = None
+        reason = answer.get("reason")
+
+    previous_verdict, previous_recall_ref = _write_verdict(
+        pattern_id, verdict, recall_ref, source=source
+    )
+
+    return {
+        "pattern_id": pattern_id,
+        "name": found["name"],
+        "verdict": verdict,
+        "recall_ref": recall_ref,
+        "reason": reason,
+        "candidates_considered": len(candidates),
+        "previous_verdict": previous_verdict,
+        "previous_recall_ref": previous_recall_ref,
+        "changed": previous_verdict is not None
+        and (previous_verdict, previous_recall_ref) != (verdict, recall_ref),
+    }
+
+
 def assess_all(*, only_missing: bool = True, limit: int | None = None) -> NoveltyReport:
     patterns = _load_patterns()
     if only_missing:
@@ -217,50 +378,21 @@ def assess_all(*, only_missing: bool = True, limit: int | None = None) -> Novelt
 
     report = NoveltyReport(patterns=len(patterns))
     session = requests.Session()
-    updates: list[tuple[str, str | None, int]] = []
 
+    # Writes are now per-pattern rather than one executemany at the end. That
+    # is more round trips, but a run that dies partway keeps the verdicts it
+    # already earned instead of discarding all of them — and only_missing
+    # makes the rerun cheap.
     for pattern in patterns:
-        candidates = _shortlist(pattern["id"], pattern["vehicles"])
-        if not candidates:
-            report.no_candidates += 1
-            updates.append(("novel", None, pattern["id"]))
-            report.verdicts["novel"] = report.verdicts.get("novel", 0) + 1
-            continue
-
-        prompt = _PROMPT.format(
-            name=pattern["name"],
-            vehicles=", ".join(f"{mk} {md}" for mk, md in pattern["vehicles"]),
-            complaints="\n".join(f"- {s}" for s in _samples(pattern["id"])),
-            recalls="\n".join(
-                f"- {c['campaign_number']} ({c['vehicle']}, {c['component']}): "
-                f"{(c['summary'] or '')[:600]} {(c['consequence'] or '')[:300]}"
-                for c in candidates
-            ),
-        )
         try:
-            answer = _ask_llm(prompt, session)
+            result = assess_one(pattern["id"], source="batch", session=session)
         except Exception as exc:  # noqa: BLE001 — one bad pattern must not stop the batch
             report.failed.append((pattern["id"], str(exc)[:160]))
             continue
 
-        verdict = answer.get("verdict")
-        if verdict not in VERDICTS:
-            report.failed.append((pattern["id"], f"bad verdict {verdict!r}"))
-            continue
-        recall_ref = answer.get("recall") or None
-        if verdict == "novel":
-            recall_ref = None
-        updates.append((verdict, recall_ref, pattern["id"]))
+        if result["candidates_considered"] == 0:
+            report.no_candidates += 1
+        verdict = result["verdict"]
         report.verdicts[verdict] = report.verdicts.get(verdict, 0) + 1
-
-    if updates:
-        with lakebase.connect() as conn:
-            with conn.cursor() as cur:
-                cur.executemany(
-                    "update patterns set novelty_verdict = %s, "
-                    "novelty_recall_ref = %s, updated_at = now() where id = %s",
-                    updates,
-                )
-            conn.commit()
 
     return report
