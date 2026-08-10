@@ -189,6 +189,39 @@ def create_complaint_embeddings(conn: psycopg.Connection) -> None:
     )
 
 
+def create_recall_embeddings(conn: psycopg.Connection) -> None:
+    """Recall vectors, one per (campaign, make, model, year).
+
+    Embedded text is `summary || ' ' || consequence` rather than summary
+    alone: consequence is written in owner-facing terms ("the vehicle may
+    stall, increasing the risk of a crash") and sits closer in register to
+    complaint prose, which is what these vectors are matched against.
+    """
+    conn.execute(
+        f"""
+        create table if not exists recall_embeddings (
+            campaign_number text     not null,
+            make            text     not null,
+            model           text     not null,
+            model_year      smallint not null,
+            embedding       vector({config.EMBEDDING_DIM}),
+            model_name      text     not null,
+            embedded_at     timestamptz not null default now(),
+            primary key (campaign_number, make, model, model_year),
+            foreign key (campaign_number, make, model, model_year)
+                references recalls (campaign_number, make, model, model_year)
+                on delete cascade
+        )
+        """
+    )
+    conn.execute(
+        """
+        create index if not exists recall_embeddings_vehicle_idx
+            on recall_embeddings (make, model, model_year)
+        """
+    )
+
+
 def create_patterns(conn: psycopg.Connection) -> None:
     """One row per formed failure pattern.
 
@@ -269,6 +302,7 @@ OBJECTS: tuple[tuple[str, Callable[[psycopg.Connection], None]], ...] = (
     ("complaints", create_complaints),
     ("recalls", create_recalls),
     ("complaint_embeddings", create_complaint_embeddings),
+    ("recall_embeddings", create_recall_embeddings),
     ("patterns", create_patterns),
     ("pattern_members", create_pattern_members),
 )

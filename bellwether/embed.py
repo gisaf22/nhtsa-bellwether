@@ -166,6 +166,60 @@ def _embed_partition(rows: Iterator, vector_column: str) -> Iterator:
     yield written
 
 
+_RECALL_UPSERT = """
+    insert into recall_embeddings
+        (campaign_number, make, model, model_year, embedding, model_name)
+    values (%s, %s, %s, %s, %s, %s)
+    on conflict (campaign_number, make, model, model_year) do update set
+        embedding = excluded.embedding,
+        model_name = excluded.model_name,
+        embedded_at = now()
+"""
+
+
+def embed_recalls(*, only_missing: bool = True) -> "EmbedReport":
+    """Embed recall summary+consequence. Driver-local — a few hundred rows."""
+    conditions = ["coalesce(r.summary, r.consequence) is not null"]
+    if only_missing:
+        conditions.append(
+            "not exists (select 1 from recall_embeddings e "
+            "where e.campaign_number = r.campaign_number and e.make = r.make "
+            "and e.model = r.model and e.model_year = r.model_year "
+            "and e.embedding is not null)"
+        )
+    pending = lakebase.execute(
+        f"""
+        select r.campaign_number, r.make, r.model, r.model_year,
+               trim(concat_ws(' ', r.summary, r.consequence))
+        from recalls r where {' and '.join(conditions)}
+        """,
+        fetch="all",
+    )
+
+    report = EmbedReport(to_embed=len(pending))
+    if not pending:
+        return report
+
+    session = requests.Session()
+    token = lambda *, force=False: lakebase.mint_token(force=force)
+
+    for start in range(0, len(pending), MAX_INPUTS_PER_REQUEST):
+        batch = pending[start : start + MAX_INPUTS_PER_REQUEST]
+        vectors = embed_batch([row[4] for row in batch], token, session)
+        rows = [
+            (row[0], row[1], row[2], row[3], str(list(vec)), EMBEDDING_ENDPOINT)
+            for row, vec in zip(batch, vectors)
+        ]
+        with lakebase.connect() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(_RECALL_UPSERT, rows)
+            conn.commit()
+        report.embedded += len(rows)
+
+    report.written = report.embedded
+    return report
+
+
 @dataclass
 class EmbedReport:
     to_embed: int = 0

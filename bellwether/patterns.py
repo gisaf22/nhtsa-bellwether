@@ -217,6 +217,25 @@ def _provisional_name(conn, member_odis: list[int]) -> str:
 # --- Scoring ----------------------------------------------------------------
 
 
+# Severity is a deterministic bucket off `ratio`, not an LLM judgement of harm.
+# It says "this pattern's recent rate is N times its own baseline", nothing
+# about injury or crash risk — the name is the brief's, the meaning is narrow.
+SEVERITY_THRESHOLDS: tuple[tuple[float, str], ...] = (
+    (4.0, "high"),
+    (2.0, "medium"),
+    (1.0, "low"),
+)
+
+
+def severity_for(ratio: float | None) -> str | None:
+    if ratio is None:
+        return None
+    for threshold, label in SEVERITY_THRESHOLDS:
+        if ratio >= threshold:
+            return label
+    return "none"
+
+
 @dataclass
 class ScoringReport:
     patterns_scored: int = 0
@@ -267,14 +286,15 @@ def score_patterns(*, today: date | None = None) -> ScoringReport:
         else:
             ratio = (recent / RECENT_DAYS) / (baseline / BASELINE_DAYS)
             report.patterns_with_ratio += 1
-        updates.append((recent, baseline, ratio, pattern_id))
+        updates.append((recent, baseline, ratio, severity_for(ratio), pattern_id))
 
     with lakebase.connect() as conn:
         with conn.cursor() as cur:
             cur.executemany(
                 """
                 update patterns
-                set recent_count = %s, baseline_count = %s, ratio = %s, updated_at = now()
+                set recent_count = %s, baseline_count = %s, ratio = %s,
+                    severity = %s, updated_at = now()
                 where id = %s
                 """,
                 updates,

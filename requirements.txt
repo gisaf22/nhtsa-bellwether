@@ -4,3 +4,4 @@ psycopg[binary]
 pgvector
 numpy
 pyspark
+streamlit
