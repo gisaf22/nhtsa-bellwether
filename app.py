@@ -49,9 +49,15 @@ NOVELTY_STYLE = {
 # Default view: what a human should look at. Everything else is one click away
 # rather than in the way.
 VIEWS = {
+    # `severity is null` is deliberately included: a null severity means the
+    # trailing baseline window was empty, so no rate could be computed — not
+    # that the pattern is unimportant. Those are the youngest patterns in the
+    # set, which is the signal this tool exists to surface. Excluding them
+    # filtered out 45 novel-or-partly-covered patterns.
     "Needs attention": (
         "novelty_verdict in ('novel', 'partially_covered') "
-        "and severity in ('medium', 'high') and state <> 'hidden'"
+        "and (severity in ('medium', 'high') or severity is null) "
+        "and state <> 'hidden'"
     ),
     "All active": "state <> 'hidden'",
     "Everything (incl. hidden)": "true",
@@ -59,7 +65,20 @@ VIEWS = {
 
 
 @st.cache_data(ttl=60)
-def load_patterns(view: str) -> list[dict]:
+def count_patterns(view: str) -> int:
+    """How many patterns the view actually matches, before the page limit.
+
+    Kept separate from load_patterns so the header can say "showing 50 of
+    275" — the page size is a display bound, and reporting it as the total
+    misstates the size of the backlog.
+    """
+    return lakebase.execute(
+        f"select count(*) from patterns where {VIEWS[view]}", fetch="one"
+    )[0]
+
+
+@st.cache_data(ttl=60)
+def load_patterns(view: str, limit: int = PAGE_SIZE) -> list[dict]:
     """Ranked patterns, with the pieces of the name string as real columns.
 
     The dominant vehicle, the affected-vehicle count and the failure category
@@ -107,8 +126,9 @@ def load_patterns(view: str) -> list[dict]:
         -- Unactioned first, then hardest-hitting: a triage inbox, not a report.
         order by (p.state = 'new') desc, p.ratio desc nulls last,
                  p.member_count desc
-        limit {PAGE_SIZE}
+        limit %s
         """,
+        (limit,),
         fetch="all",
     )
     keys = (
@@ -198,7 +218,15 @@ st.sidebar.caption(
     "severity. Patterns with too little history to rank carry no severity and "
     "appear under **All active**."
 )
-patterns = load_patterns(view)
+if st.session_state.get("view") != view:
+    # A new view starts at one page again, rather than inheriting however far
+    # the reader had scrolled through the previous one.
+    st.session_state["view"] = view
+    st.session_state["limit"] = PAGE_SIZE
+
+limit = st.session_state.setdefault("limit", PAGE_SIZE)
+total = count_patterns(view)
+patterns = load_patterns(view, limit)
 
 if not patterns:
     st.info("Nothing in this view. Try **All active** in the sidebar.")
@@ -238,9 +266,15 @@ def render_row(p: dict) -> None:
         f":gray[{fleet} · {p['member_count']} reports]"
     )
     cols[2].markdown(f":gray[`{p['category'] or 'UNCATEGORISED'}`]")
-    cols[3].markdown(
-        f"{severity_icon} :{severity_colour}[{format_severity(p['severity'])}]"
-    )
+    if p["severity"] is None:
+        # Not a severity value — these patterns are unscored, not low-risk,
+        # and inventing a bucket for them would assert a rate that was never
+        # computed. Flagged as emerging instead, in its own colour.
+        cols[3].markdown(":blue[🆕 **emerging**]  \n:gray[no baseline yet]")
+    else:
+        cols[3].markdown(
+            f"{severity_icon} :{severity_colour}[{format_severity(p['severity'])}]"
+        )
     cols[4].markdown(f"{novelty_icon} :{novelty_colour}[{novelty_label}]")
     if p["state"] != "new":
         cols[4].markdown(f":gray[{p['state']}]")
@@ -251,7 +285,11 @@ def render_row(p: dict) -> None:
     st.divider()
 
 
-st.subheader(f"{view} · {len(patterns)}")
+st.subheader(view)
+st.caption(
+    f"Showing all {total} patterns" if len(patterns) >= total
+    else f"Showing {len(patterns)} of {total} patterns"
+)
 header = st.columns([1.4, 3.6, 2.4, 1.9, 1.9, 1.0])
 for col, title in zip(
     header, ("Ratio", "Vehicle", "Category", "Severity", "Recall", "")
@@ -261,6 +299,12 @@ st.divider()
 
 for p in patterns:
     render_row(p)
+
+if len(patterns) < total:
+    remaining = total - len(patterns)
+    if st.button(f"Load {min(PAGE_SIZE, remaining)} more ({remaining} left)"):
+        st.session_state["limit"] = limit + PAGE_SIZE
+        st.rerun()
 
 pattern = load_pattern(st.session_state["selected_id"])
 if pattern is None:
