@@ -5,3 +5,4 @@ pgvector
 numpy
 pyspark
 streamlit
+databricks-sdk

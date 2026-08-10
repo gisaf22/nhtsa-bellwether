@@ -191,7 +191,8 @@ def resolve(*, force_refresh: bool = False) -> Connection:
     """Resolve connection parameters.
 
     Priority: Databricks-injected env vars, then a freshly minted workspace
-    token, then LAKEBASE_PASSWORD from .env as a local fallback.
+    token (SDK default auth, then DATABRICKS_PROFILE if set), then
+    LAKEBASE_PASSWORD from .env as a local fallback.
     """
     injected = _databricks_injected()
     if injected is not None:
@@ -220,21 +221,24 @@ def resolve(*, force_refresh: bool = False) -> Connection:
             f"missing connection settings: {', '.join(missing)}"
         )
 
-    if config.DATABRICKS_PROFILE:
-        try:
-            password = mint_token(force=force_refresh)
-            source = f"minted:{config.DATABRICKS_PROFILE}"
-        except LakebaseAuthError:
-            if not settings.password:
-                raise
-            password, source = settings.password, "env:LAKEBASE_PASSWORD"
-    elif settings.password:
+    # Minting is attempted unconditionally rather than only when
+    # DATABRICKS_PROFILE is set. mint_token() already tries the SDK's default
+    # auth chain first — which resolves to the app's own service principal
+    # when deployed — and only uses the CLI profile when that env var is
+    # present. Gating this branch on the profile meant an app deployed with
+    # LAKEBASE_HOST/LAKEBASE_USER but no injected PGHOST could not
+    # authenticate at all, despite having a perfectly good identity.
+    try:
+        password = mint_token(force=force_refresh)
+        source = f"minted:{config.DATABRICKS_PROFILE or 'sdk-default'}"
+    except LakebaseAuthError:
+        if not settings.password:
+            raise LakebaseAuthError(
+                "no credential available: the SDK's default auth chain found "
+                "no identity, DATABRICKS_PROFILE is unset, and there is no "
+                "LAKEBASE_PASSWORD fallback"
+            )
         password, source = settings.password, "env:LAKEBASE_PASSWORD"
-    else:
-        raise LakebaseAuthError(
-            "no credential available: set DATABRICKS_PROFILE to mint a token, "
-            "or LAKEBASE_PASSWORD as a fallback"
-        )
 
     return Connection(
         host=settings.host,  # type: ignore[arg-type]
