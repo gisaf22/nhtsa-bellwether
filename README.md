@@ -56,7 +56,7 @@ streamlit run app.py                                             # local UI
 ```
 
 Deployed as a Databricks App (`app.yaml`) backed by the same Lakebase
-instance: **[add the app URL here once deployed]**.
+instance: **https://nhtsa-bellwether-7474645136578041.aws.databricksapps.com/**
 
 ## Limitations
 
