@@ -14,6 +14,20 @@ from bellwether import lakebase
 STATES = ("new", "acknowledged", "watching", "hidden")
 PAGE_SIZE = 50
 
+# A null ratio is not a missing value: the pattern's baseline window holds no
+# incidents, so there is no rate to divide by. Shown as a label rather than an
+# empty cell so it reads as a stated fact about the pattern, not a broken row.
+NO_BASELINE = "insufficient history"
+
+
+def format_ratio(ratio: float | None) -> str:
+    """Every row renders as a string so the column never mixes types."""
+    return NO_BASELINE if ratio is None else f"{ratio:.2f}×"
+
+
+def format_severity(severity: str | None) -> str:
+    return severity or NO_BASELINE
+
 
 @st.cache_data(ttl=60)
 def load_patterns(include_hidden: bool) -> list[dict]:
@@ -106,8 +120,8 @@ st.subheader("Ranked patterns")
 st.dataframe(
     [
         {
-            "ratio": p["ratio"],
-            "severity": p["severity"],
+            "ratio": format_ratio(p["ratio"]),
+            "severity": format_severity(p["severity"]),
             "name": p["name"],
             "members": p["member_count"],
             "recent": p["recent_count"],
@@ -127,8 +141,13 @@ st.divider()
 st.subheader(pattern["name"])
 
 cols = st.columns(5)
-cols[0].metric("Ratio", f"{pattern['ratio']:.2f}×" if pattern["ratio"] else "—")
-cols[1].metric("Severity", pattern["severity"] or "—")
+cols[0].metric("Ratio", format_ratio(pattern["ratio"]))
+cols[1].metric("Severity", format_severity(pattern["severity"]))
+if pattern["ratio"] is None:
+    st.caption(
+        "No incidents in this pattern's baseline window, so there is no rate "
+        "to compare the recent window against — unrankable, not zero."
+    )
 cols[2].metric("Members", pattern["member_count"])
 cols[3].metric("Recent / baseline", f"{pattern['recent_count']} / {pattern['baseline_count']}")
 cols[4].metric("Novelty", pattern["novelty_verdict"] or "—")
