@@ -112,6 +112,14 @@ NEIGHBOUR_CAP: int = 25
 
 EMBEDDING_DIM: int = 1024
 
+# Base URL for serving endpoints (embeddings and the novelty LLM). Lives here
+# rather than in embed.py because novelty.py needs it too, and importing it
+# from embed.py pulled pyspark into every consumer — which meant the MCP
+# server could not be deployed without a Spark install it never uses.
+WORKSPACE_HOST: str = os.getenv(
+    "DATABRICKS_HOST", "https://dbc-d547a350-6525.cloud.databricks.com"
+).rstrip("/")
+
 
 # --- Windows ---------------------------------------------------------------
 

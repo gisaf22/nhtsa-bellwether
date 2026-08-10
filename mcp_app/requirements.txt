@@ -1,0 +1,9 @@
+# Deliberately slimmer than the root requirements: the MCP server only needs
+# novelty.py's dependency set. No pyspark (the batch embedding path is not
+# reachable from the tools) and no streamlit.
+requests
+python-dotenv
+psycopg[binary]
+numpy
+databricks-sdk
+fastmcp>=3.2.0

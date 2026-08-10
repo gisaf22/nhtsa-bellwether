@@ -9,11 +9,18 @@ Intended for Databricks Playground / Agent Bricks. Run locally with:
 
     python bellwether_mcp_server.py
 
+That serves HTTP on PORT (default 8000) with the MCP endpoint at /mcp,
+which is also how it runs as a Databricks App. Set MCP_TRANSPORT=stdio to
+run it over stdio instead, for a local client that expects a subprocess.
+
 Requires the same Lakebase credentials as the rest of the project (see
-.env.example): DATABRICKS_PROFILE, or the LAKEBASE_* variables.
+.env.example): DATABRICKS_PROFILE locally, or the app's own service
+principal when deployed.
 """
 
 from __future__ import annotations
+
+import os
 
 from fastmcp import FastMCP
 
@@ -154,4 +161,14 @@ def check_novelty(pattern_id: int) -> dict:
 
 
 if __name__ == "__main__":
-    mcp.run()
+    # Databricks Apps injects PORT and expects the process to bind it on
+    # 0.0.0.0; the agent then registers the /mcp path on the app's URL.
+    if os.getenv("MCP_TRANSPORT", "http") == "stdio":
+        mcp.run()
+    else:
+        mcp.run(
+            transport="http",
+            host="0.0.0.0",
+            port=int(os.getenv("PORT", "8000")),
+            path="/mcp",
+        )

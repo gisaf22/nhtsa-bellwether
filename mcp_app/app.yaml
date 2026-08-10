@@ -1,0 +1,10 @@
+# Databricks App config for the MCP server, deployed separately from the
+# Streamlit app (which uses the app.yaml at the repo root — a Databricks App
+# reads app.yaml from the root of its own source directory, so the two cannot
+# share one). See the MCP section of the README for how the source directory
+# is assembled.
+#
+# No env block: Lakebase auth comes from the app's own service principal via
+# the attached resource, which lakebase.py picks up through the SDK's default
+# auth chain. Nothing here needs a secret scope.
+command: ["python", "bellwether_mcp_server.py"]

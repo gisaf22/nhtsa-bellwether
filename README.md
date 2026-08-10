@@ -86,6 +86,24 @@ This is the conversational, tool-choosing interface. It is independent of the
 Streamlit app and the two coexist — the app is the one-click version, the MCP
 server is for asking questions and having an agent decide which tool to call.
 
+Deployed as its own Databricks App, with the MCP endpoint at `/mcp`:
+**https://mcp-nhtsa-bellwether-server-7474645136578041.aws.databricksapps.com/mcp**
+
+The system prompt to configure on the Agent Bricks agent is in
+[agent/system_prompt.md](agent/system_prompt.md).
+
+### Example prompts
+
+Once the server is registered with an agent:
+
+- *"What recalls might be related to pattern 51?"* — read-only lookup.
+- *"Is the Honda Civic steering pattern novel or already known?"* — the agent
+  reads the stored verdict and the evidence behind it.
+- *"Check whether pattern 221 is already covered by a recall."* — runs the
+  full check and saves the verdict.
+- *"Re-check pattern 43 and tell me if the verdict changed."* — a write, with
+  the before/after reported back.
+
 ## Limitations
 
 Stated plainly, because each one changes how the output should be read.

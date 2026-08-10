@@ -24,9 +24,9 @@ from pyspark.sql import SparkSession, types as T
 from . import config, lakebase
 
 EMBEDDING_ENDPOINT = "databricks-gte-large-en"
-WORKSPACE_HOST = os.getenv(
-    "DATABRICKS_HOST", "https://dbc-d547a350-6525.cloud.databricks.com"
-).rstrip("/")
+# Re-exported from config so existing callers keep working; see config for
+# why it moved.
+WORKSPACE_HOST = config.WORKSPACE_HOST
 
 # Measured ceiling: 8 inputs succeed, 16 is rejected outright.
 MAX_INPUTS_PER_REQUEST = 8

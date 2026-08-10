@@ -29,7 +29,7 @@ import numpy as np
 import requests
 
 from . import lakebase
-from .embed import WORKSPACE_HOST
+from .config import WORKSPACE_HOST
 
 LLM_ENDPOINT = os.getenv("BELLWETHER_LLM_ENDPOINT", "databricks-llama-4-maverick")
 SHORTLIST_SIZE = 5
@@ -257,8 +257,12 @@ def _write_verdict(
     """Persist a verdict, preserving any prior one in novelty_history.
 
     Returns the values that were replaced, so callers can report what
-    changed. History is only written when a prior verdict existed — a
-    first-ever assessment overwrites nothing and has nothing to preserve.
+    changed. History is only written when a prior verdict existed AND the
+    new answer actually differs from it: a first-ever assessment overwrites
+    nothing, and a reassessment that confirms the stored verdict has nothing
+    to preserve either. Without that second condition an agent re-checking
+    the same pattern in conversation would pile up identical rows and bury
+    the real changes.
 
     The read and both writes share one transaction: a verdict must never be
     replaced without its predecessor being recorded, and `for update` holds
@@ -274,7 +278,10 @@ def _write_verdict(
             raise LookupError(f"no pattern with id {pattern_id}")
         old_verdict, old_recall_ref = row
 
-        if old_verdict is not None:
+        if old_verdict is not None and (old_verdict, old_recall_ref) != (
+            verdict,
+            recall_ref,
+        ):
             conn.execute(
                 """
                 insert into novelty_history (
