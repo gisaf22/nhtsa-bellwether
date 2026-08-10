@@ -10,7 +10,7 @@ narratives by meaning.
 
 This ingests complaints, groups them semantically, ranks each pattern against
 an age-matched baseline, and checks whether it's already covered by a published
-recall or open investigation.
+recall.
 
 See [docs/brief.md](docs/brief.md) for the problem, workflow, and what the MVP
 delivers.
