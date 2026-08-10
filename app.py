@@ -11,7 +11,11 @@ import streamlit as st
 
 from bellwether import lakebase
 
-STATES = ("new", "acknowledged", "watching", "hidden")
+# "watching" existed in an earlier three-button revision and had no behaviour
+# distinct from "reviewed" — a fourth state and a third button for the same
+# thing. Retired; any pre-existing rows were migrated to "reviewed" by hand,
+# once, outside the app.
+STATES = ("new", "reviewed", "hidden")
 PAGE_SIZE = 50
 
 # A null ratio is not a missing value: the pattern's baseline window holds no
@@ -31,54 +35,109 @@ def format_severity(severity: str | None) -> str:
 
 # Status coding, per the visualisation guidance: an icon AND a word, never
 # colour alone — these are the triage signal, and a reader who cannot
-# distinguish the hues must still be able to sort the list.
+# distinguish the hues must still be able to sort the list. Colours are a
+# restrained, muted set rather than Streamlit's saturated named palette
+# (plain "red"/"orange" reads as an alert-box, not a data label) — each is a
+# specific hex so severity and novelty read as one deliberate system instead
+# of default-theme accents.
 SEVERITY_STYLE = {
-    "high": ("🔴", "red"),
-    "medium": ("🟠", "orange"),
-    "low": ("🟡", "gray"),
-    "none": ("⚪", "gray"),
-    None: ("◽", "gray"),
+    "high": ("🔴", "#c0392b"),
+    "medium": ("🟠", "#b8721d"),
+    "low": ("🟡", "#8a8f98"),
+    "none": ("⚪", "#8a8f98"),
+    None: ("◽", "#8a8f98"),
 }
 NOVELTY_STYLE = {
-    "novel": ("✦", "violet", "novel"),
-    "partially_covered": ("◐", "orange", "partly covered"),
-    "known": ("✓", "gray", "known recall"),
-    None: ("·", "gray", "unassessed"),
+    "novel": ("✦", "#6b4fa0", "novel"),
+    "partially_covered": ("◐", "#b8721d", "partly covered"),
+    "known": ("✓", "#8a8f98", "known recall"),
+    None: ("·", "#8a8f98", "unassessed"),
+}
+EMERGING_COLOUR = "#2f6f9f"
+
+# Raw NHTSA component_coarse strings, plain-English. Covers only the
+# categories actually present among the 275 formed patterns (checked via
+# load_patterns across all views) — not a general NHTSA code table, so a
+# category formed by a future pipeline run may fall through to the title-case
+# fallback in category_label() below.
+CATEGORY_LABELS = {
+    "AIR BAGS": "Air bags",
+    "BACK OVER PREVENTION": "Backup camera / rear visibility",
+    "ELECTRICAL SYSTEM": "Electrical system",
+    "ENGINE": "Engine",
+    "ENGINE AND ENGINE COOLING": "Engine & cooling",
+    "EXTERIOR LIGHTING": "Exterior lighting",
+    "FORWARD COLLISION AVOIDANCE": "Forward collision avoidance",
+    "FUEL SYSTEM": "Fuel system",
+    "FUEL/PROPULSION SYSTEM": "Fuel / propulsion system",
+    "LANE DEPARTURE": "Lane departure warning",
+    "LATCHES/LOCKS/LINKAGES": "Latches, locks & linkages",
+    "POWER TRAIN": "Powertrain",
+    "SEAT BELTS": "Seat belts",
+    "SEATS": "Seats",
+    "SERVICE BRAKES": "Brakes",
+    "STEERING": "Steering",
+    "STRUCTURE": "Body / structure",
+    "SUSPENSION": "Suspension",
+    "TIRES": "Tires",
+    "UNKNOWN OR OTHER": "Uncategorised",
+    "VEHICLE SPEED CONTROL": "Speed control / cruise control",
+    "VISIBILITY": "Visibility",
+    "VISIBILITY/WIPER": "Visibility / wipers",
+    "WHEELS": "Wheels",
 }
 
-# Default view: what a human should look at. Everything else is one click away
-# rather than in the way.
-VIEWS = {
-    # `severity is null` is deliberately included: a null severity means the
-    # trailing baseline window was empty, so no rate could be computed — not
-    # that the pattern is unimportant. Those are the youngest patterns in the
-    # set, which is the signal this tool exists to surface. Excluding them
-    # filtered out 45 novel-or-partly-covered patterns.
-    "Needs attention": (
-        "novelty_verdict in ('novel', 'partially_covered') "
-        "and (severity in ('medium', 'high') or severity is null) "
-        "and state <> 'hidden'"
-    ),
-    "All active": "state <> 'hidden'",
-    "Everything (incl. hidden)": "true",
-}
+
+def category_label(raw: str | None) -> str:
+    if not raw:
+        return "Uncategorised"
+    if raw in CATEGORY_LABELS:
+        return CATEGORY_LABELS[raw]
+    # Not in the checked set: fall back to a readable guess rather than
+    # shipping raw NHTSA shouting-case, and flag it as unmapped so a future
+    # pass can add it deliberately instead of relying on the guess forever.
+    return raw.title() + " *"
+
+# Two real views, not three: "Needs attention" / "All active" / "Everything"
+# were the same 275-row table with three overlapping WHERE clauses, not three
+# distinct datasets — Everything only ever added back the 1-4 hidden rows.
+# Surfaced is the filtered default; "show all" is a plain toggle over the same
+# query; dismissed rows get their own link at the bottom of All Patterns
+# instead of top-level billing next to the thing they were dismissed from.
+#
+# `severity is null` is deliberately included in SURFACED: a null severity
+# means the trailing baseline window was empty, so no rate could be computed
+# — not that the pattern is unimportant. Those are the youngest patterns in
+# the set, which is the signal this tool exists to surface. Excluding them
+# filtered out 45 novel-or-partly-covered patterns.
+SURFACED_FILTER = (
+    "novelty_verdict in ('novel', 'partially_covered') "
+    "and (severity in ('medium', 'high') or severity is null)"
+)
+
+
+def view_filter(*, show_all: bool, show_dismissed: bool) -> str:
+    base = "true" if show_all else SURFACED_FILTER
+    if show_dismissed:
+        return base
+    return f"({base}) and state <> 'hidden'"
 
 
 @st.cache_data(ttl=60)
-def count_patterns(view: str) -> int:
-    """How many patterns the view actually matches, before the page limit.
+def count_patterns(where: str) -> int:
+    """How many patterns the filter actually matches, before the page limit.
 
     Kept separate from load_patterns so the header can say "showing 50 of
     275" — the page size is a display bound, and reporting it as the total
     misstates the size of the backlog.
     """
     return lakebase.execute(
-        f"select count(*) from patterns where {VIEWS[view]}", fetch="one"
+        f"select count(*) from patterns where {where}", fetch="one"
     )[0]
 
 
 @st.cache_data(ttl=60)
-def load_patterns(view: str, limit: int = PAGE_SIZE) -> list[dict]:
+def load_patterns(where: str, limit: int = PAGE_SIZE) -> list[dict]:
     """Ranked patterns, with the pieces of the name string as real columns.
 
     The dominant vehicle, the affected-vehicle count and the failure category
@@ -122,7 +181,7 @@ def load_patterns(view: str, limit: int = PAGE_SIZE) -> list[dict]:
         left join vehicle_rank v on v.pattern_id = p.id and v.rn = 1
         left join vehicle_count vc on vc.pattern_id = p.id
         left join category_rank c on c.pattern_id = p.id and c.rn = 1
-        where {VIEWS[view]}
+        where {where}
         -- Unactioned first, then hardest-hitting: a triage inbox, not a report.
         order by (p.state = 'new') desc, p.ratio desc nulls last,
                  p.member_count desc
@@ -145,18 +204,32 @@ def load_pattern(pattern_id: int) -> dict | None:
     """
     row = lakebase.execute(
         """
-        select id, name, member_count, recent_count, baseline_count, ratio,
-               severity, state, novelty_verdict, novelty_recall_ref
-        from patterns where id = %s
+        with category_rank as (
+            select pm.pattern_id, category,
+                   row_number() over (
+                       partition by pm.pattern_id order by count(*) desc, category
+                   ) as rn
+            from pattern_members pm
+            join complaints c on c.odi_number = pm.odi_number,
+                 unnest(coalesce(c.components_coarse, array['UNCATEGORISED'])) as category
+            where pm.pattern_id = %s
+            group by pm.pattern_id, category
+        )
+        select p.id, p.name, p.member_count, p.recent_count, p.baseline_count,
+               p.ratio, p.severity, p.state, p.novelty_verdict,
+               p.novelty_recall_ref, c.category
+        from patterns p
+        left join category_rank c on c.pattern_id = p.id and c.rn = 1
+        where p.id = %s
         """,
-        (pattern_id,),
+        (pattern_id, pattern_id),
         fetch="one",
     )
     if row is None:
         return None
     keys = (
         "id name member_count recent_count baseline_count ratio severity "
-        "state novelty_verdict novelty_recall_ref"
+        "state novelty_verdict novelty_recall_ref category"
     ).split()
     return dict(zip(keys, row))
 
@@ -196,12 +269,16 @@ def load_recall(campaign_number: str) -> dict | None:
     return dict(zip(keys, row))
 
 
-def set_state(pattern_id: int, state: str) -> None:
+def set_state(pattern_id: int, state: str, *, toast: str) -> None:
     lakebase.execute(
         "update patterns set state = %s, updated_at = now() where id = %s",
         (state, pattern_id),
     )
     st.cache_data.clear()
+    # st.toast is designed to survive exactly one rerun, so calling it here
+    # and rerunning right after still shows it — without this the row simply
+    # disappeared from the list with no sign the click did anything.
+    st.toast(toast, icon="✅")
 
 
 # Layout primitives that arrived in specific Streamlit releases. The deployed
@@ -243,22 +320,48 @@ st.set_page_config(
     # it open would just steal width from the two panes.
     initial_sidebar_state="collapsed",
 )
+
+# Tightens Streamlit's default vertical rhythm and mutes secondary text
+# without a component library — the block-container top pad and the space
+# st.metric reserves for a help icon it isn't given are pure default-theme
+# padding, not content. `small` is a scoped class for the row metadata line
+# so it reads as secondary at a glance instead of competing with the vehicle
+# name above it for attention.
+st.markdown(
+    """
+    <style>
+    .block-container { padding-top: 2.2rem; }
+    div[data-testid="stMetricValue"] { font-size: 1.4rem; }
+    .bw-small { font-size: 0.82rem; color: var(--text-color-secondary, #8a8f98); }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("Bellwether")
 st.caption(
     "Emerging failure patterns in NHTSA owner complaints, ranked by recent "
-    "rate against each pattern's own trailing baseline. A ratio directs "
-    "attention; it does not assert a defect."
+    "rate against each pattern's own trailing baseline vs. its own history — "
+    "not severity or a confirmed defect."
 )
 
 # --- Filter bar -------------------------------------------------------------
 
-filter_bar = st.columns([3.0, 2.0])
-view = filter_bar[0].radio(
-    "View", list(VIEWS), index=0, horizontal=True, label_visibility="collapsed"
+filter_bar = st.columns([1.3, 2.3])
+show_all = filter_bar[0].toggle(
+    "Show all patterns",
+    value=False,
+    help=(
+        "Off: only novel or partly-covered patterns at medium/high severity, "
+        "or too new to score yet (Surfaced). On: every active pattern, "
+        "including known recalls and low/no-severity ones."
+    ),
 )
+view = "All patterns" if show_all else "Surfaced"
 filter_bar[1].caption(
-    "**Needs attention**: novel or partly-covered, at medium/high severity or "
-    "too new to score."
+    "Every active pattern, ranked by ratio." if show_all
+    else "Novel or partly-covered, at medium/high severity or too new to "
+    "score — the rest are one toggle away."
 )
 
 if st.session_state.get("view") != view:
@@ -266,13 +369,19 @@ if st.session_state.get("view") != view:
     # the reader had scrolled through the previous one.
     st.session_state["view"] = view
     st.session_state["limit"] = PAGE_SIZE
+    st.session_state["show_dismissed"] = False
 
 limit = st.session_state.setdefault("limit", PAGE_SIZE)
-total = count_patterns(view)
-patterns = load_patterns(view, limit)
+show_dismissed = st.session_state.get("show_dismissed", False) and show_all
+where = view_filter(show_all=show_all, show_dismissed=show_dismissed)
+total = count_patterns(where)
+patterns = load_patterns(where, limit)
 
-if not patterns:
-    st.info("Nothing in this view. Try **All active** above.")
+if not patterns and not show_all:
+    st.info("Nothing needs attention right now. Try **Show all patterns** above.")
+    st.stop()
+elif not patterns:
+    st.info("No patterns match.")
     st.stop()
 
 if st.session_state.get("selected_id") not in {p["id"] for p in patterns}:
@@ -298,13 +407,30 @@ def render_row(p: dict) -> None:
     cols = st.columns([1.1, 3.0, 1.8])
 
     # Ratio as a numeric badge, weighted: an urgent pattern is heavier than an
-    # also-ran, so the eye lands on it before reading a word.
+    # also-ran, so the eye lands on it before reading a word. Wrapped in a
+    # help-cursor span (title=) rather than st.metric's help icon, which is
+    # too wide a hitbox for a compact list badge.
+    ratio_help = (
+        "Recent complaint rate vs. this pattern's own historical baseline — "
+        "not a severity or defect measure."
+    )
     if p["ratio"] is None:
-        cols[0].markdown(":gray[no history]")
+        cols[0].markdown(
+            f'<span class="bw-small" title="{ratio_help}">no history</span>',
+            unsafe_allow_html=True,
+        )
     elif urgent:
-        cols[0].markdown(f"### :{severity_colour}[{p['ratio']:.2f}×]")
+        cols[0].markdown(
+            f'<span style="color:{severity_colour};font-size:1.5rem;'
+            f'font-weight:700" title="{ratio_help}">{p["ratio"]:.2f}×</span>',
+            unsafe_allow_html=True,
+        )
     else:
-        cols[0].markdown(f":gray[{p['ratio']:.2f}×]")
+        cols[0].markdown(
+            f'<span class="bw-small" title="{ratio_help}">'
+            f'{p["ratio"]:.2f}×</span>',
+            unsafe_allow_html=True,
+        )
 
     vehicles = p["vehicles"] or 1
     fleet = "1 vehicle" if vehicles == 1 else f"{vehicles} vehicles"
@@ -322,23 +448,32 @@ def render_row(p: dict) -> None:
         st.session_state["selected_id"] = p["id"]
         st.rerun()
     cols[1].markdown(
-        f":gray[{fleet} · {p['member_count']} reports · "
-        f"`{p['category'] or 'UNCATEGORISED'}`]"
+        f'<span class="bw-small">{fleet} · {p["member_count"]} reports · '
+        f'{category_label(p["category"])}</span>',
+        unsafe_allow_html=True,
     )
 
     if p["severity"] is None:
         # Not a severity value — these patterns are unscored, not low-risk,
         # and inventing a bucket for them would assert a rate that was never
         # computed. Flagged as emerging instead, in its own colour.
-        severity_chip = ":blue[🆕 **emerging**]"
+        severity_chip = (
+            f'<span style="color:{EMERGING_COLOUR}">🆕 <b>emerging</b></span>'
+        )
     else:
         severity_chip = (
-            f"{severity_icon} :{severity_colour}[{format_severity(p['severity'])}]"
+            f'<span style="color:{severity_colour}">{severity_icon} '
+            f'{format_severity(p["severity"])}</span>'
         )
-    state_chip = "" if p["state"] == "new" else f"  \n:gray[{p['state']}]"
+    state_chip = (
+        "" if p["state"] == "new"
+        else f'<br><span class="bw-small">{p["state"]}</span>'
+    )
     cols[2].markdown(
-        f"{severity_chip}  \n{novelty_icon} :{novelty_colour}[{novelty_label}]"
-        f"{state_chip}"
+        f'{severity_chip}<br>'
+        f'<span style="color:{novelty_colour}">{novelty_icon} '
+        f'{novelty_label}</span>{state_chip}',
+        unsafe_allow_html=True,
     )
 
     # st.divider()'s vertical margins add ~60px of dead space per row, which
@@ -352,9 +487,21 @@ def render_detail(pattern: dict) -> None:
     renders inside the right-hand pane instead of below the list.
     """
     st.subheader(pattern["name"])
+    st.markdown(
+        f'<span class="bw-small">{category_label(pattern.get("category"))}'
+        f"</span>",
+        unsafe_allow_html=True,
+    )
 
     cols = st.columns(3)
-    cols[0].metric("Ratio", format_ratio(pattern["ratio"]))
+    cols[0].metric(
+        "Ratio",
+        format_ratio(pattern["ratio"]),
+        help=(
+            "Recent complaint rate vs. this pattern's own historical "
+            "baseline — not a severity or defect measure."
+        ),
+    )
     cols[1].metric("Severity", format_severity(pattern["severity"]))
     cols[2].metric("Novelty", pattern["novelty_verdict"] or "—")
     cols = st.columns(3)
@@ -367,20 +514,35 @@ def render_detail(pattern: dict) -> None:
             "rate to compare the recent window against — unrankable, not zero."
         )
 
-    # Uneven split: at 1280px an even quarter is too narrow for "Acknowledge"
-    # and it wraps mid-word.
-    action = st.columns([1.5, 1, 1, 1])
-    if action[0].button("Acknowledge", use_container_width=True):
-        set_state(pattern["id"], "acknowledged")
+    # Two actions, not four: "watch" duplicated "reviewed" with no behaviour
+    # of its own. Reset (back to "new") is folded into Dismiss's neighbour
+    # only when it applies, so a fresh pattern doesn't show a no-op button.
+    action = st.columns([1, 1, 1])
+    if action[0].button(
+        "Mark reviewed",
+        use_container_width=True,
+        disabled=pattern["state"] == "reviewed",
+        help="Reviewed — stays visible in both views, marked as looked at.",
+    ):
+        set_state(pattern["id"], "reviewed", toast="Marked as reviewed")
         st.rerun()
-    if action[1].button("Watch", use_container_width=True):
-        set_state(pattern["id"], "watching")
+    if action[1].button(
+        "Dismiss",
+        use_container_width=True,
+        disabled=pattern["state"] == "hidden",
+        help=(
+            "Dismiss — hides from Surfaced and All Patterns; still visible "
+            "under “Show dismissed” at the bottom of All Patterns."
+        ),
+    ):
+        set_state(pattern["id"], "hidden", toast="Dismissed")
         st.rerun()
-    if action[2].button("Hide", use_container_width=True):
-        set_state(pattern["id"], "hidden")
-        st.rerun()
-    if action[3].button("Reset", use_container_width=True):
-        set_state(pattern["id"], "new")
+    if pattern["state"] != "new" and action[2].button(
+        "Undo → new",
+        use_container_width=True,
+        help="Clear reviewed/dismissed and return this pattern to New.",
+    ):
+        set_state(pattern["id"], "new", toast="Reset to new")
         st.rerun()
     st.caption(f"Current state: **{pattern['state']}**")
 
@@ -449,6 +611,23 @@ with list_pane:
             ):
                 st.session_state["limit"] = limit + PAGE_SIZE
                 st.rerun()
+
+        # Dismissed patterns get a link at the bottom of the full list, not a
+        # peer tab next to Surfaced — a corner case you can reach on purpose,
+        # not one competing for top-level attention. Not offered under
+        # Surfaced, since dismissed rows are never in that filter anyway.
+        if show_all:
+            st.markdown(ROW_RULE, unsafe_allow_html=True)
+            if not show_dismissed:
+                if st.button("Show dismissed patterns"):
+                    st.session_state["show_dismissed"] = True
+                    st.session_state["limit"] = PAGE_SIZE
+                    st.rerun()
+            else:
+                if st.button("Hide dismissed patterns"):
+                    st.session_state["show_dismissed"] = False
+                    st.session_state["limit"] = PAGE_SIZE
+                    st.rerun()
 
 with detail_pane:
     with pane(height=LIST_PANE_HEIGHT, border=True):
