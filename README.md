@@ -1,30 +1,62 @@
 # nhtsa-bellwether
 
-Emerging vehicle failure patterns from NHTSA owner complaints.
+Turns 20K+ NHTSA owner complaints into ranked emerging failure patterns,
+checks each one against existing recalls with an LLM agent, and surfaces the
+problems that haven't been recalled yet — before a keyword search or a
+component-code filter would ever group them together.
 
-Complaints describing the same failure share almost no vocabulary — "shudders
-between 30 and 40", "hesitates when accelerating", "feels like it's slipping".
-NHTSA's component categories are too coarse to separate them and keyword search
-groups nothing, so the pattern is invisible until something groups the
-narratives by meaning.
+## How it works
 
-This ingests complaints, groups them semantically, ranks each pattern against
-an age-matched baseline, and checks whether it's already covered by a published
-recall.
+```
+NHTSA API (complaints + recalls)
+        │  ingest, classify is_failure_report
+        ▼
+Embeddings (databricks-gte-large-en)          — complaint narratives + recall text
+        │
+        ▼
+Pattern formation (Spark)                     — single-linkage clustering on similarity
+        │
+        ▼
+Severity scoring                              — recent rate vs. each pattern's own baseline
+        │
+        ▼
+Novelty agent (LLM)                           — shortlist candidate recalls, verdict: novel / known / partially covered
+        │
+        ▼
+Streamlit app on Databricks Apps              — ranked triage inbox, backed by Lakebase
+```
 
-See [docs/brief.md](docs/brief.md) for the problem, workflow, and what the MVP
-delivers.
+Lakebase (Postgres + pgvector) is the operational store end to end — complaints,
+recalls, embeddings, patterns, and app-written triage state all live there.
 
-## Stack
+## The numbers
 
-Lakebase for the operational store and embeddings · Spark for batch embedding
-and rate computation · Databricks App frontend · LLM agent for recall matching
+| | |
+|---|---|
+| Failure reports | 20,101 |
+| Recalls | 397 |
+| Patterns formed | 275 |
+| Novel | 163 |
+| Known (recall exists) | 88 |
+| Partially covered | 24 |
 
-## Status
+## Running it
 
-End-to-end and running on real data: 20,101 failure reports, 275 patterns,
-17,207 assigned members, all 275 patterns scored and given a novelty verdict
-(163 novel, 88 known, 24 partially covered).
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Set `DATABRICKS_PROFILE` (or the `LAKEBASE_*` variables in `.env.example`) so
+`bellwether/lakebase.py` can mint a Postgres credential, then:
+
+```bash
+python -c "from bellwether import schema; schema.create_all()"   # DDL
+streamlit run app.py                                             # local UI
+```
+
+Deployed as a Databricks App (`app.yaml`) backed by the same Lakebase
+instance: **[add the app URL here once deployed]**.
 
 ## Limitations
 
@@ -41,7 +73,7 @@ vehicle", not "this was already known when it emerged."
 
 **`patterns` is load-bearing and formation is now a one-way door.** The table
 holds all 275 novelty verdicts and whatever triage state the app has written
-(acknowledge / watch / hide). `form_patterns()` begins with
+(reviewed / dismissed). `form_patterns()` begins with
 `truncate ... restart identity cascade` on every run, so re-running it destroys
 every verdict and every state, and reassigns pattern IDs so nothing can be
 matched back. **Do not re-run `form_patterns()`.** `score_patterns()` and the
@@ -65,3 +97,10 @@ time: it is not in the capstone requirements brief, confirmed by reading the
 brief rather than inferred. The app writes triage state as a plain column
 update on `patterns`, with no append-only event log, because the event log only
 ever existed to feed CDF analytics.
+
+## More detail
+
+- [docs/brief.md](docs/brief.md) — the problem statement, workflow, and what
+  the MVP delivers.
+- [docs/rejected-approaches.md](docs/rejected-approaches.md) — retrieval and
+  scoring approaches that were tried and rejected, with the evidence.
