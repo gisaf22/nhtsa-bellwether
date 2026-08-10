@@ -204,7 +204,45 @@ def set_state(pattern_id: int, state: str) -> None:
     st.cache_data.clear()
 
 
-st.set_page_config(page_title="Bellwether", layout="wide")
+# Layout primitives that arrived in specific Streamlit releases. The deployed
+# build is older than this development one (it is what surfaced the
+# width="stretch" TypeError), and its exact version is not knowable from here,
+# so each is feature-detected and degraded rather than assumed: without the
+# scroll pane the list simply grows the page, which is the old behaviour.
+try:
+    _ST_VERSION = tuple(int(part) for part in st.__version__.split(".")[:2])
+except (AttributeError, ValueError):
+    _ST_VERSION = (0, 0)
+SUPPORTS_SCROLL_PANE = _ST_VERSION >= (1, 31)  # st.container(height=...)
+SUPPORTS_BORDER = _ST_VERSION >= (1, 29)  # st.container(border=...)
+
+LIST_PANE_HEIGHT = 720
+
+# Hairline row separator. Colour is a neutral alpha rather than a fixed grey so
+# it reads the same in Streamlit's light and dark themes.
+ROW_RULE = (
+    "<hr style='margin:0.4rem 0 0.6rem 0;border:none;"
+    "border-top:1px solid rgba(128,128,128,0.25)'>"
+)
+
+
+def pane(*, height: int | None = None, border: bool = False):
+    """A container with whatever of height/border this Streamlit supports."""
+    kwargs: dict = {}
+    if border and SUPPORTS_BORDER:
+        kwargs["border"] = True
+    if height is not None and SUPPORTS_SCROLL_PANE:
+        kwargs["height"] = height
+    return st.container(**kwargs)
+
+
+st.set_page_config(
+    page_title="Bellwether",
+    layout="wide",
+    # The rail is empty now that filters sit in the main content area; leaving
+    # it open would just steal width from the two panes.
+    initial_sidebar_state="collapsed",
+)
 st.title("Bellwether")
 st.caption(
     "Emerging failure patterns in NHTSA owner complaints, ranked by recent "
@@ -212,12 +250,17 @@ st.caption(
     "attention; it does not assert a defect."
 )
 
-view = st.sidebar.radio("View", list(VIEWS), index=0)
-st.sidebar.caption(
-    "**Needs attention** is novel or partly-covered patterns at medium or high "
-    "severity. Patterns with too little history to rank carry no severity and "
-    "appear under **All active**."
+# --- Filter bar -------------------------------------------------------------
+
+filter_bar = st.columns([3.0, 2.0])
+view = filter_bar[0].radio(
+    "View", list(VIEWS), index=0, horizontal=True, label_visibility="collapsed"
 )
+filter_bar[1].caption(
+    "**Needs attention**: novel or partly-covered, at medium/high severity or "
+    "too new to score."
+)
+
 if st.session_state.get("view") != view:
     # A new view starts at one page again, rather than inheriting however far
     # the reader had scrolled through the previous one.
@@ -229,7 +272,7 @@ total = count_patterns(view)
 patterns = load_patterns(view, limit)
 
 if not patterns:
-    st.info("Nothing in this view. Try **All active** in the sidebar.")
+    st.info("Nothing in this view. Try **All active** above.")
     st.stop()
 
 if st.session_state.get("selected_id") not in {p["id"] for p in patterns}:
@@ -237,7 +280,12 @@ if st.session_state.get("selected_id") not in {p["id"] for p in patterns}:
 
 
 def render_row(p: dict) -> None:
-    """One inbox row: ratio, vehicle, category, severity, novelty, open."""
+    """One inbox row, laid out for a half-width pane.
+
+    Three columns rather than six: the pane is roughly half a laptop screen,
+    and six columns of chips wrapped into unreadable stacks at that width. The
+    chips and the open control share the right-hand column instead.
+    """
     severity_icon, severity_colour = SEVERITY_STYLE.get(
         p["severity"], SEVERITY_STYLE[None]
     )
@@ -247,7 +295,7 @@ def render_row(p: dict) -> None:
     urgent = p["severity"] in ("high", "medium")
     selected = p["id"] == st.session_state["selected_id"]
 
-    cols = st.columns([1.4, 3.6, 2.4, 1.9, 1.9, 1.0])
+    cols = st.columns([1.1, 3.0, 1.8])
 
     # Ratio as a numeric badge, weighted: an urgent pattern is heavier than an
     # also-ran, so the eye lands on it before reading a word.
@@ -261,117 +309,150 @@ def render_row(p: dict) -> None:
     vehicles = p["vehicles"] or 1
     fleet = "1 vehicle" if vehicles == 1 else f"{vehicles} vehicles"
     label = p["vehicle"] or p["name"]
+
+    # The vehicle name is the click target rather than a separate Open button:
+    # a button per row on top of a title line made rows ~110px tall, so only
+    # three fitted on screen. This is one control instead of two, and the
+    # highlight marks the selection without grey-disabling the row's title.
+    if cols[1].button(
+        label,
+        key=f"open_{p['id']}",
+        type="primary" if selected else "secondary",
+    ):
+        st.session_state["selected_id"] = p["id"]
+        st.rerun()
     cols[1].markdown(
-        f"{'**' if selected else ''}{label}{'**' if selected else ''}  \n"
-        f":gray[{fleet} · {p['member_count']} reports]"
+        f":gray[{fleet} · {p['member_count']} reports · "
+        f"`{p['category'] or 'UNCATEGORISED'}`]"
     )
-    cols[2].markdown(f":gray[`{p['category'] or 'UNCATEGORISED'}`]")
+
     if p["severity"] is None:
         # Not a severity value — these patterns are unscored, not low-risk,
         # and inventing a bucket for them would assert a rate that was never
         # computed. Flagged as emerging instead, in its own colour.
-        cols[3].markdown(":blue[🆕 **emerging**]  \n:gray[no baseline yet]")
+        severity_chip = ":blue[🆕 **emerging**]"
     else:
-        cols[3].markdown(
+        severity_chip = (
             f"{severity_icon} :{severity_colour}[{format_severity(p['severity'])}]"
         )
-    cols[4].markdown(f"{novelty_icon} :{novelty_colour}[{novelty_label}]")
-    if p["state"] != "new":
-        cols[4].markdown(f":gray[{p['state']}]")
-    if cols[5].button("Open", key=f"open_{p['id']}", disabled=selected):
-        st.session_state["selected_id"] = p["id"]
+    state_chip = "" if p["state"] == "new" else f"  \n:gray[{p['state']}]"
+    cols[2].markdown(
+        f"{severity_chip}  \n{novelty_icon} :{novelty_colour}[{novelty_label}]"
+        f"{state_chip}"
+    )
+
+    # st.divider()'s vertical margins add ~60px of dead space per row, which
+    # at 50 rows is most of the pane. A hairline rule separates them just as
+    # well in a fraction of the height.
+    st.markdown(ROW_RULE, unsafe_allow_html=True)
+
+
+def render_detail(pattern: dict) -> None:
+    """The detail panel. Same content and same writes as before — it just
+    renders inside the right-hand pane instead of below the list.
+    """
+    st.subheader(pattern["name"])
+
+    cols = st.columns(3)
+    cols[0].metric("Ratio", format_ratio(pattern["ratio"]))
+    cols[1].metric("Severity", format_severity(pattern["severity"]))
+    cols[2].metric("Novelty", pattern["novelty_verdict"] or "—")
+    cols = st.columns(3)
+    cols[0].metric("Members", pattern["member_count"])
+    cols[1].metric("Recent", pattern["recent_count"])
+    cols[2].metric("Baseline", pattern["baseline_count"])
+    if pattern["ratio"] is None:
+        st.caption(
+            "No incidents in this pattern's baseline window, so there is no "
+            "rate to compare the recent window against — unrankable, not zero."
+        )
+
+    # Uneven split: at 1280px an even quarter is too narrow for "Acknowledge"
+    # and it wraps mid-word.
+    action = st.columns([1.5, 1, 1, 1])
+    if action[0].button("Acknowledge", use_container_width=True):
+        set_state(pattern["id"], "acknowledged")
         st.rerun()
-
-    st.divider()
-
-
-st.subheader(view)
-st.caption(
-    f"Showing all {total} patterns" if len(patterns) >= total
-    else f"Showing {len(patterns)} of {total} patterns"
-)
-header = st.columns([1.4, 3.6, 2.4, 1.9, 1.9, 1.0])
-for col, title in zip(
-    header, ("Ratio", "Vehicle", "Category", "Severity", "Recall", "")
-):
-    col.markdown(f":gray[**{title}**]")
-st.divider()
-
-for p in patterns:
-    render_row(p)
-
-if len(patterns) < total:
-    remaining = total - len(patterns)
-    if st.button(f"Load {min(PAGE_SIZE, remaining)} more ({remaining} left)"):
-        st.session_state["limit"] = limit + PAGE_SIZE
+    if action[1].button("Watch", use_container_width=True):
+        set_state(pattern["id"], "watching")
         st.rerun()
+    if action[2].button("Hide", use_container_width=True):
+        set_state(pattern["id"], "hidden")
+        st.rerun()
+    if action[3].button("Reset", use_container_width=True):
+        set_state(pattern["id"], "new")
+        st.rerun()
+    st.caption(f"Current state: **{pattern['state']}**")
+
+    if pattern["novelty_recall_ref"]:
+        recall = load_recall(pattern["novelty_recall_ref"])
+        with st.expander(
+            f"Recall {pattern['novelty_recall_ref']} ({pattern['novelty_verdict']})"
+        ):
+            if recall is None:
+                st.write("Campaign not found in the recalls table.")
+            else:
+                st.write(f"**Component:** {recall['component']}")
+                st.write(f"**Received:** {recall['report_received_date']}")
+                st.write(recall["summary"])
+                st.write(f"**Consequence:** {recall['consequence']}")
+                st.write(f"**Remedy:** {recall['remedy']}")
+
+    members = load_members(pattern["id"])
+    st.write(f"**Members ({len(members)})**")
+    st.dataframe(
+        [
+            {
+                "odi": m["odi_number"],
+                "vehicle": f"{m['make']} {m['model']} {m['model_year']}",
+                "incident": m["date_of_incident"],
+                "similarity": round(m["similarity"], 3),
+            }
+            for m in members
+        ],
+        # Not width="stretch": that spelling needs Streamlit >= 1.49 and the
+        # deployed build is older, where `width` takes an int and a string
+        # raises TypeError. use_container_width works on both.
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.write("**Sample narratives**")
+    for m in members[:5]:
+        with st.expander(
+            f"{m['odi_number']} · {m['make']} {m['model']} {m['model_year']}"
+        ):
+            st.write(m["summary"])
+
+
+# --- Two panes: list on the left, detail on the right -----------------------
 
 pattern = load_pattern(st.session_state["selected_id"])
-if pattern is None:
-    st.stop()
+list_pane, detail_pane = st.columns([1.25, 1], gap="large")
 
-st.divider()
-st.subheader(pattern["name"])
-
-cols = st.columns(5)
-cols[0].metric("Ratio", format_ratio(pattern["ratio"]))
-cols[1].metric("Severity", format_severity(pattern["severity"]))
-if pattern["ratio"] is None:
+with list_pane:
+    st.subheader(view)
     st.caption(
-        "No incidents in this pattern's baseline window, so there is no rate "
-        "to compare the recent window against — unrankable, not zero."
+        f"Showing all {total} patterns" if len(patterns) >= total
+        else f"Showing {len(patterns)} of {total} patterns"
     )
-cols[2].metric("Members", pattern["member_count"])
-cols[3].metric("Recent / baseline", f"{pattern['recent_count']} / {pattern['baseline_count']}")
-cols[4].metric("Novelty", pattern["novelty_verdict"] or "—")
+    # The list scrolls inside its own pane where Streamlit supports it, so
+    # selecting a pattern never scrolls the detail panel out of view.
+    with pane(height=LIST_PANE_HEIGHT):
+        for p in patterns:
+            render_row(p)
 
-action = st.columns(4)
-if action[0].button("Acknowledge"):
-    set_state(pattern["id"], "acknowledged")
-    st.rerun()
-if action[1].button("Watch"):
-    set_state(pattern["id"], "watching")
-    st.rerun()
-if action[2].button("Hide"):
-    set_state(pattern["id"], "hidden")
-    st.rerun()
-if action[3].button("Reset to new"):
-    set_state(pattern["id"], "new")
-    st.rerun()
-st.caption(f"Current state: **{pattern['state']}**")
+        if len(patterns) < total:
+            remaining = total - len(patterns)
+            if st.button(
+                f"Load {min(PAGE_SIZE, remaining)} more ({remaining} left)"
+            ):
+                st.session_state["limit"] = limit + PAGE_SIZE
+                st.rerun()
 
-if pattern["novelty_recall_ref"]:
-    recall = load_recall(pattern["novelty_recall_ref"])
-    with st.expander(f"Recall {pattern['novelty_recall_ref']} ({pattern['novelty_verdict']})"):
-        if recall is None:
-            st.write("Campaign not found in the recalls table.")
+with detail_pane:
+    with pane(height=LIST_PANE_HEIGHT, border=True):
+        if pattern is None:
+            st.info("Select a pattern from the list.")
         else:
-            st.write(f"**Component:** {recall['component']}")
-            st.write(f"**Received:** {recall['report_received_date']}")
-            st.write(recall["summary"])
-            st.write(f"**Consequence:** {recall['consequence']}")
-            st.write(f"**Remedy:** {recall['remedy']}")
-
-members = load_members(pattern["id"])
-st.write(f"**Members ({len(members)})**")
-st.dataframe(
-    [
-        {
-            "odi": m["odi_number"],
-            "vehicle": f"{m['make']} {m['model']} {m['model_year']}",
-            "incident": m["date_of_incident"],
-            "similarity": round(m["similarity"], 3),
-        }
-        for m in members
-    ],
-    # Not width="stretch": that spelling needs Streamlit >= 1.49 and the
-    # deployed build is older, where `width` takes an int and a string raises
-    # TypeError. use_container_width works on both.
-    use_container_width=True,
-    hide_index=True,
-)
-
-st.write("**Sample narratives**")
-for m in members[:5]:
-    with st.expander(f"{m['odi_number']} · {m['make']} {m['model']} {m['model_year']}"):
-        st.write(m["summary"])
+            render_detail(pattern)
