@@ -29,24 +29,116 @@ def format_severity(severity: str | None) -> str:
     return severity or NO_BASELINE
 
 
+# Status coding, per the visualisation guidance: an icon AND a word, never
+# colour alone — these are the triage signal, and a reader who cannot
+# distinguish the hues must still be able to sort the list.
+SEVERITY_STYLE = {
+    "high": ("🔴", "red"),
+    "medium": ("🟠", "orange"),
+    "low": ("🟡", "gray"),
+    "none": ("⚪", "gray"),
+    None: ("◽", "gray"),
+}
+NOVELTY_STYLE = {
+    "novel": ("✦", "violet", "novel"),
+    "partially_covered": ("◐", "orange", "partly covered"),
+    "known": ("✓", "gray", "known recall"),
+    None: ("·", "gray", "unassessed"),
+}
+
+# Default view: what a human should look at. Everything else is one click away
+# rather than in the way.
+VIEWS = {
+    "Needs attention": (
+        "novelty_verdict in ('novel', 'partially_covered') "
+        "and severity in ('medium', 'high') and state <> 'hidden'"
+    ),
+    "All active": "state <> 'hidden'",
+    "Everything (incl. hidden)": "true",
+}
+
+
 @st.cache_data(ttl=60)
-def load_patterns(include_hidden: bool) -> list[dict]:
+def load_patterns(view: str) -> list[dict]:
+    """Ranked patterns, with the pieces of the name string as real columns.
+
+    The dominant vehicle, the affected-vehicle count and the failure category
+    are derived here rather than parsed back out of `patterns.name` — the name
+    is a display string built by formation, and splitting it on ' — ' would
+    break the moment a component contains a dash.
+    """
     rows = lakebase.execute(
         f"""
-        select id, name, member_count, recent_count, baseline_count, ratio,
-               severity, state, novelty_verdict, novelty_recall_ref
-        from patterns
-        {'' if include_hidden else "where state <> 'hidden'"}
-        order by ratio desc nulls last, member_count desc
+        with member_vehicles as (
+            select pm.pattern_id, c.make, c.model, c.components_coarse
+            from pattern_members pm
+            join complaints c on c.odi_number = pm.odi_number
+        ),
+        vehicle_rank as (
+            select pattern_id, make || ' ' || model as vehicle,
+                   row_number() over (
+                       partition by pattern_id
+                       order by count(*) desc, make || ' ' || model
+                   ) as rn
+            from member_vehicles group by pattern_id, make, model
+        ),
+        vehicle_count as (
+            select pattern_id, count(distinct make || ' ' || model) as vehicles
+            from member_vehicles group by pattern_id
+        ),
+        category_rank as (
+            select pattern_id, category,
+                   row_number() over (
+                       partition by pattern_id order by count(*) desc, category
+                   ) as rn
+            from member_vehicles,
+                 unnest(coalesce(components_coarse, array['UNCATEGORISED'])) as category
+            group by pattern_id, category
+        )
+        select p.id, p.name, p.member_count, p.recent_count, p.baseline_count,
+               p.ratio, p.severity, p.state, p.novelty_verdict,
+               p.novelty_recall_ref,
+               v.vehicle, coalesce(vc.vehicles, 0), c.category
+        from patterns p
+        left join vehicle_rank v on v.pattern_id = p.id and v.rn = 1
+        left join vehicle_count vc on vc.pattern_id = p.id
+        left join category_rank c on c.pattern_id = p.id and c.rn = 1
+        where {VIEWS[view]}
+        -- Unactioned first, then hardest-hitting: a triage inbox, not a report.
+        order by (p.state = 'new') desc, p.ratio desc nulls last,
+                 p.member_count desc
         limit {PAGE_SIZE}
         """,
         fetch="all",
     )
     keys = (
         "id name member_count recent_count baseline_count ratio severity "
-        "state novelty_verdict novelty_recall_ref"
+        "state novelty_verdict novelty_recall_ref vehicle vehicles category"
     ).split()
     return [dict(zip(keys, r)) for r in rows]
+
+
+@st.cache_data(ttl=60)
+def load_pattern(pattern_id: int) -> dict | None:
+    """One pattern by id, so the detail view survives its row leaving the list
+    (acknowledging a pattern can filter it straight out of the current view).
+    """
+    row = lakebase.execute(
+        """
+        select id, name, member_count, recent_count, baseline_count, ratio,
+               severity, state, novelty_verdict, novelty_recall_ref
+        from patterns where id = %s
+        """,
+        (pattern_id,),
+        fetch="one",
+    )
+    if row is None:
+        return None
+    keys = (
+        "id name member_count recent_count baseline_count ratio severity "
+        "state novelty_verdict novelty_recall_ref"
+    ).split()
+    return dict(zip(keys, row))
 
 
 @st.cache_data(ttl=60)
@@ -100,42 +192,79 @@ st.caption(
     "attention; it does not assert a defect."
 )
 
-include_hidden = st.sidebar.checkbox("Show hidden", value=False)
-patterns = load_patterns(include_hidden)
+view = st.sidebar.radio("View", list(VIEWS), index=0)
+st.sidebar.caption(
+    "**Needs attention** is novel or partly-covered patterns at medium or high "
+    "severity. Patterns with too little history to rank carry no severity and "
+    "appear under **All active**."
+)
+patterns = load_patterns(view)
 
 if not patterns:
-    st.info("No patterns yet — run formation and scoring first.")
+    st.info("Nothing in this view. Try **All active** in the sidebar.")
     st.stop()
 
-labels = {
-    p["id"]: f"{p['ratio']:.2f}× · {p['name']}" if p["ratio"] is not None
-    else f"—    · {p['name']}"
-    for p in patterns
-}
-selected_id = st.sidebar.radio(
-    "Patterns", [p["id"] for p in patterns], format_func=lambda i: labels[i]
-)
+if st.session_state.get("selected_id") not in {p["id"] for p in patterns}:
+    st.session_state["selected_id"] = patterns[0]["id"]
 
-st.subheader("Ranked patterns")
-st.dataframe(
-    [
-        {
-            "ratio": format_ratio(p["ratio"]),
-            "severity": format_severity(p["severity"]),
-            "name": p["name"],
-            "members": p["member_count"],
-            "recent": p["recent_count"],
-            "novelty": p["novelty_verdict"],
-            "recall": p["novelty_recall_ref"],
-            "state": p["state"],
-        }
-        for p in patterns
-    ],
-    width="stretch",
-    hide_index=True,
-)
 
-pattern = next(p for p in patterns if p["id"] == selected_id)
+def render_row(p: dict) -> None:
+    """One inbox row: ratio, vehicle, category, severity, novelty, open."""
+    severity_icon, severity_colour = SEVERITY_STYLE.get(
+        p["severity"], SEVERITY_STYLE[None]
+    )
+    novelty_icon, novelty_colour, novelty_label = NOVELTY_STYLE.get(
+        p["novelty_verdict"], NOVELTY_STYLE[None]
+    )
+    urgent = p["severity"] in ("high", "medium")
+    selected = p["id"] == st.session_state["selected_id"]
+
+    cols = st.columns([1.4, 3.6, 2.4, 1.9, 1.9, 1.0])
+
+    # Ratio as a numeric badge, weighted: an urgent pattern is heavier than an
+    # also-ran, so the eye lands on it before reading a word.
+    if p["ratio"] is None:
+        cols[0].markdown(":gray[no history]")
+    elif urgent:
+        cols[0].markdown(f"### :{severity_colour}[{p['ratio']:.2f}×]")
+    else:
+        cols[0].markdown(f":gray[{p['ratio']:.2f}×]")
+
+    vehicles = p["vehicles"] or 1
+    fleet = "1 vehicle" if vehicles == 1 else f"{vehicles} vehicles"
+    label = p["vehicle"] or p["name"]
+    cols[1].markdown(
+        f"{'**' if selected else ''}{label}{'**' if selected else ''}  \n"
+        f":gray[{fleet} · {p['member_count']} reports]"
+    )
+    cols[2].markdown(f":gray[`{p['category'] or 'UNCATEGORISED'}`]")
+    cols[3].markdown(
+        f"{severity_icon} :{severity_colour}[{format_severity(p['severity'])}]"
+    )
+    cols[4].markdown(f"{novelty_icon} :{novelty_colour}[{novelty_label}]")
+    if p["state"] != "new":
+        cols[4].markdown(f":gray[{p['state']}]")
+    if cols[5].button("Open", key=f"open_{p['id']}", disabled=selected):
+        st.session_state["selected_id"] = p["id"]
+        st.rerun()
+
+    st.divider()
+
+
+st.subheader(f"{view} · {len(patterns)}")
+header = st.columns([1.4, 3.6, 2.4, 1.9, 1.9, 1.0])
+for col, title in zip(
+    header, ("Ratio", "Vehicle", "Category", "Severity", "Recall", "")
+):
+    col.markdown(f":gray[**{title}**]")
+st.divider()
+
+for p in patterns:
+    render_row(p)
+
+pattern = load_pattern(st.session_state["selected_id"])
+if pattern is None:
+    st.stop()
 
 st.divider()
 st.subheader(pattern["name"])
@@ -191,7 +320,10 @@ st.dataframe(
         }
         for m in members
     ],
-    width="stretch",
+    # Not width="stretch": that spelling needs Streamlit >= 1.49 and the
+    # deployed build is older, where `width` takes an int and a string raises
+    # TypeError. use_container_width works on both.
+    use_container_width=True,
     hide_index=True,
 )
 

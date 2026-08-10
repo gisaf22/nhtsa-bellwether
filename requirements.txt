@@ -4,5 +4,5 @@ psycopg[binary]
 pgvector
 numpy
 pyspark
-streamlit
+streamlit>=1.30
 databricks-sdk
